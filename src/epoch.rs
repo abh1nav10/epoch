@@ -1,4 +1,5 @@
-#![allow(unused)]
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use std::cell::{Cell, RefCell};
 use std::mem;
 use std::ptr::{self, NonNull};
@@ -6,20 +7,20 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 static EPOCH: Epoch = Epoch::new();
 
-/// Every thread has got three lists. It starts pushing the things
-/// into the recent list. One an operation it checks the global epoch
-/// if it finds that it has advanced or if the thread itself advances
-/// the global epoch, it will deallocate the memory pointed to by the
-/// pointers in the LAST list, make PREVIOUS the last, RECENT the previous
-/// and RECENT will be a List::new().
+// Every thread has got two lists. It starts pushing the things
+// into the recent list. One an operation it checks the global epoch
+// if it finds that it has advanced or if the thread itself advances
+// the global epoch, it will deallocate the memory pointed to by the
+// pointers in the PREVIOUS list, make RECENT the previus, and
+// RECENT will have a Vec::new();
 thread_local! {
-    static RECENT: RefCell<List> = RefCell::new(List::new());
-    static PREVIOUS: RefCell<List> = RefCell::new(List::new());
+    static RECENT: RefCell<List> = const {RefCell::new(List::new())};
+    static PREVIOUS: RefCell<List> = const {RefCell::new(List::new())};
 }
 
-/// TODO: Add loom tests. Find a way to use the loom variant the thread local with
-/// lazily initialized statics. The loom::thread_local macro does not match for a
-/// macro call inside of it. If it were to be true we could have used lazy_static.
+// TODO: Add loom tests. Find a way to use the loom variant the thread local with
+// lazily initialized statics. The loom::thread_local macro does not match for a
+// macro call inside of it. If it were to be true we could have used lazy_static.
 
 /// Holds the current state.
 struct Epoch {
@@ -37,7 +38,7 @@ impl Epoch {
 }
 
 /// Holder of the retired things.
-/// Has got three active instances at any point of time.
+/// Has got two active instances at any point of time.
 struct List {
     stamp: isize,
     elements: Vec<ListEntry>,
@@ -82,7 +83,10 @@ impl<T> Common for T {}
 /// A trait to make sure that the pointers are dropped in accordance with
 /// how they were constructed in the first place.
 pub trait Reclaim {
-    fn reclaim(&self, ptr: *mut dyn Common);
+    ///SAFETY:
+    ///    Safety relies on the promise that 'ptr' should not be null
+    ///    and it meets all the requirements of being a valid pointer.
+    unsafe fn reclaim(&self, ptr: *mut dyn Common);
 }
 
 /// A type for reclaiming memory pointed to by raw pointers that
@@ -95,15 +99,21 @@ impl DropBox {
     }
 }
 
+impl Default for DropBox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reclaim for DropBox {
-    fn reclaim(&self, ptr: *mut dyn Common) {
-        /// SAFETY:
-        ///     All the pointer safety requirements such as
-        ///     proper alignment must be upheld. Further, DropBox
-        ///     is meant to be used when the underlying raw pointer
-        ///     was constructed using a Box. Not maintaining this
-        ///     invariant will lead to a instant Undefined Behaviour.
-        let owned = unsafe { Box::from_raw(ptr) };
+    /// SAFETY:
+    ///     All the pointer safety requirements such as
+    ///     proper alignment must be upheld. Further, DropBox
+    ///     is meant to be used when the underlying raw pointer
+    ///     was constructed using a Box. Not maintaining this
+    ///     invariant will lead to a instant Undefined Behaviour.
+    unsafe fn reclaim(&self, ptr: *mut dyn Common) {
+        let owned = Box::from_raw(ptr);
         mem::drop(owned);
     }
 }
@@ -118,16 +128,21 @@ impl DropPointer {
     }
 }
 
+impl Default for DropPointer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reclaim for DropPointer {
-    fn reclaim(&self, ptr: *mut dyn Common) {
-        /// SAFETY:
-        ///    The safety requirements can be read from
-        ///    std::ptr::drop_in_place() in the standard
-        ///    library docs.
-        ///    https://doc.rust-lang.org/std/ptr/fn.drop_in_place.html
-        unsafe {
-            ptr::drop_in_place(ptr);
-        }
+    /// SAFETY:
+    ///    The safety requirements can be read from
+    ///    std::ptr::drop_in_place() in the standard
+    ///    library docs.
+    ///    https://doc.rust-lang.org/std/ptr/fn.drop_in_place.html
+    ///
+    unsafe fn reclaim(&self, ptr: *mut dyn Common) {
+        ptr::drop_in_place(ptr);
     }
 }
 
@@ -158,10 +173,10 @@ impl Registration {
     pub fn find_register() -> Option<Worker> {
         let mut current = EPOCH.registrations.head.load(Ordering::Acquire);
         while !current.is_null() {
-            /// SAFETY:
-            ///    The raw pointer cannot be null as a registration is
-            ///    not deallocated until the end of the program.
-            ///    Therefore, the operation is safe.
+            // SAFETY:
+            //    The raw pointer cannot be null as a registration is
+            //    not deallocated until the end of the program.
+            //    Therefore, the operation is safe.
             let deref = unsafe { &(*current) };
             if deref
                 .active
@@ -193,19 +208,19 @@ impl Registration {
                 .compare_exchange(current, boxed, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                /// SAFETY:
-                ///    The pointer being dereferenced cannot be null
-                ///    as a registration is never deallocated until the
-                ///    end of the program. Therefore the operation is safe.
+                // SAFETY:
+                //    The pointer being dereferenced cannot be null
+                //    as a registration is never deallocated until the
+                //    end of the program. Therefore the operation is safe.
                 let shared = unsafe { &(*boxed) };
                 let ret = Worker { reg: shared };
                 return ret;
             } else {
-                /// SAFETY:
-                ///    As the function makes it clear, the underlying
-                ///    raw pointer can never be null and the function is
-                ///    called only once on a pointer. Therefore,
-                ///    the operation is safe.
+                // SAFETY:
+                //    As the function makes it clear, the underlying
+                //    raw pointer can never be null and the function is
+                //    called only once on a pointer. Therefore,
+                //    the operation is safe.
                 let _ = unsafe { Box::from_raw(boxed) };
             }
         }
@@ -231,6 +246,12 @@ impl Drop for Worker {
 pub struct Res<'a, T> {
     worker: &'a Worker,
     ptr: *mut T,
+}
+
+impl<T> Res<'_, T> {
+    pub fn get_ptr(&self) -> *mut T {
+        self.ptr
+    }
 }
 
 impl<T> Drop for Res<'_, T> {
@@ -267,15 +288,13 @@ impl Worker {
                 let stamp = RECENT.with(|interior| interior.borrow().stamp);
                 if stamp < count as isize {
                     Self::rearrange(current as *mut dyn Common, deleter);
-                    self.reg.counter.set(-1);
-                    return;
+                    break;
                 } else {
                     let entry = ListEntry::new(current as *mut dyn Common, deleter);
                     if let Some(e) = entry {
                         RECENT.with(|interior| interior.borrow_mut().elements.push(e));
                     }
-                    self.reg.counter.set(-1);
-                    return;
+                    break;
                 }
             } else {
                 current = ptr.load(Ordering::Acquire);
@@ -302,8 +321,15 @@ impl Worker {
             borrowed.stamp = counter - 1;
             mem::replace(&mut borrowed.elements, make_prev)
         });
-        for element in rec {
-            element.deleter.reclaim(element.value.as_ptr());
+        //SAFETY:
+        //   Safe because the ptr is checked to be non-null
+        //   before insertion and the fact that the user
+        //   is required to uphold the safety requirements
+        //   of a ptr i.e it must be valid.
+        unsafe {
+            for element in rec {
+                element.deleter.reclaim(element.value.as_ptr());
+            }
         }
     }
 
@@ -311,13 +337,13 @@ impl Worker {
         let count = EPOCH.counter.load(Ordering::Relaxed);
         let mut current = EPOCH.registrations.head.load(Ordering::Acquire);
         while !current.is_null() {
-            /// SAFETY:
-            ///    The operation is safe because we check the
-            ///    nullability of current before dereferencing
-            ///    and the the responsibility of giving a safe pointer
-            ///    in this case does not rest on the user but is a part
-            ///    of the implementation itself and I make sure that those
-            ///    safety invariants are upheld.
+            // SAFETY:
+            //    The operation is safe because we check the
+            //    nullability of current before dereferencing
+            //    and the the responsibility of giving a safe pointer
+            //    in this case does not rest on the user but is a part
+            //    of the implementation itself and I make sure that those
+            //    safety invariants are upheld.
             let reg = unsafe { &(*current) };
             let reg_counter = reg.counter.get();
             if reg_counter < 0 || reg_counter == count as isize {
@@ -330,6 +356,6 @@ impl Worker {
         let _ = EPOCH
             .counter
             .compare_exchange(count, ret, Ordering::Relaxed, Ordering::Relaxed);
-        return ret;
+        ret
     }
 }

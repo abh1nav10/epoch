@@ -45,6 +45,10 @@ mod tests {
         });
 
         // just to check whether things are getting dropped or not!
-        println!("{}", countdrops.load(Ordering::Relaxed));
+        let drops = countdrops.load(Ordering::Relaxed);
+
+        assert!(drops > 0);
+
+        //println!("{}", drops);
     }
 }
